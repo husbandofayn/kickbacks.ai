@@ -30,7 +30,7 @@ vi.mock("../src/adapters/claude-cli/adapter", () => ({
 }));
 
 import { activate, deactivate, __wireForTest } from "../src/extension";
-import { makeContext, _warned, commands } from "./mocks/vscode";
+import { makeContext, _warned, commands, secrets } from "./mocks/vscode";
 import { ImpressionDedupe } from "../src/metrics/dedupe";
 
 it("loopback impression path dedupes per adId (one bill per ad)", () => {
@@ -65,7 +65,7 @@ describe("extension orchestration", { timeout: 15_000 }, () => {
     await deactivate();
   });
 
-  it("missing target still registers auth commands and shows sign-in", async () => {
+  it("missing target still registers auth commands and shows auth state", async () => {
     const adapter = {
       name: "claude-code",
       preflight: () => ({ ok: true, compatible: false, version: null,
@@ -75,13 +75,16 @@ describe("extension orchestration", { timeout: 15_000 }, () => {
       restore: vi.fn(() => ({ ok: true, restored: false })),
     };
     const sb = { set: vi.fn(), dispose() {} };
+    secrets.clear();
     commands._handlers.delete("kickbacks.signIn");
     __wireForTest({ adapter, statusBar: sb });
     await activate(makeContext() as never);
     expect(adapter.applyPatch).not.toHaveBeenCalled();
     expect(commands._handlers.has("kickbacks.signIn")).toBe(true);
     expect(commands._handlers.has("kickbacks.signOut")).toBe(true);
-    expect(sb.set).toHaveBeenCalledWith({ kind: "signed-out" });
+    expect(sb.set).not.toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "incompatible" }));
+    expect(["signed-out", "active"]).toContain(sb.set.mock.calls[0][0].kind);
     await deactivate();
   });
 

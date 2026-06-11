@@ -28,6 +28,7 @@ export function locateClaudeCode(): string | null {
   // Covers local (.vscode/.cursor) AND remote/server hosts (Remote-SSH,
   // dev containers, vscode.dev) where extensions live under *-server/.
   for (const root of [join(homedir(), ".vscode", "extensions"),
+                       join(homedir(), ".vscode-insiders", "extensions"),
                        join(homedir(), ".vscode-server", "extensions"),
                        join(homedir(), ".vscode-server-insiders", "extensions"),
                        join(homedir(), ".cursor", "extensions"),
