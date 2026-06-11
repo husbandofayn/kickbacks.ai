@@ -30,7 +30,7 @@ vi.mock("../src/adapters/claude-cli/adapter", () => ({
 }));
 
 import { activate, deactivate, __wireForTest } from "../src/extension";
-import { makeContext, _warned } from "./mocks/vscode";
+import { makeContext, _warned, commands } from "./mocks/vscode";
 import { ImpressionDedupe } from "../src/metrics/dedupe";
 
 it("loopback impression path dedupes per adId (one bill per ad)", () => {
@@ -62,6 +62,26 @@ describe("extension orchestration", { timeout: 15_000 }, () => {
     // reserved for a genuine "verb array not found" miss. (Match the message,
     // not a count: unrelated warnings — e.g. the boot canary — share the mock.)
     expect(_warned.some((t) => t.includes("spinner hook"))).toBe(false);
+    await deactivate();
+  });
+
+  it("missing target still registers auth commands and shows sign-in", async () => {
+    const adapter = {
+      name: "claude-code",
+      preflight: () => ({ ok: true, compatible: false, version: null,
+        reason: "target not found" }),
+      version: () => null,
+      applyPatch: vi.fn(() => ({ ok: false, reason: "target not found" })),
+      restore: vi.fn(() => ({ ok: true, restored: false })),
+    };
+    const sb = { set: vi.fn(), dispose() {} };
+    commands._handlers.delete("kickbacks.signIn");
+    __wireForTest({ adapter, statusBar: sb });
+    await activate(makeContext() as never);
+    expect(adapter.applyPatch).not.toHaveBeenCalled();
+    expect(commands._handlers.has("kickbacks.signIn")).toBe(true);
+    expect(commands._handlers.has("kickbacks.signOut")).toBe(true);
+    expect(sb.set).toHaveBeenCalledWith({ kind: "signed-out" });
     await deactivate();
   });
 

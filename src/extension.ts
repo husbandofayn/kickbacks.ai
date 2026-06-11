@@ -277,7 +277,33 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     dlog("ext", "preflight",
       { compatible: pf.compatible, version: pf.version, reason: pf.reason });
     if (!pf.compatible) {
-      statusBar.set({ kind: "incompatible", version: pf.version ?? "unknown" });
+      const auth = new AuthClient(BASE, ctx);
+      await auth.loadCached();
+      session.set({
+        signedIn: !!auth.accessToken(),
+        injectionOn: debugCtl.on(),
+      });
+      debugCtl.setAuth({
+        signedIn: () => auth.signedIn(),
+        storageInfo: () => auth.storageInfo(),
+        signOut: () => auth.signOut(),
+      });
+      debugCtl.setSessionSnap(() => session.get());
+      const { updater } = setupSelfUpdate(
+        ctx, UPDATE_BASE, buildVersion(), localVsixPath, lastLocalVsixMtime,
+        watchFileImpl(), actx.timers, CFG.updatePollIntervalMs);
+      const showAuthState = async (): Promise<void> => {
+        statusBar.set(auth.accessToken()
+          ? { kind: "active", version: pf.version ?? "unknown" }
+          : { kind: "signed-out" });
+      };
+      registerCommands(ctx, adapter, codexAdapter, auth, debugCtl, statusBar,
+        session, updater, pf.version ?? "unknown", showAuthState);
+      if (pf.reason === "target not found") {
+        await showAuthState();
+      } else {
+        statusBar.set({ kind: "incompatible", version: pf.version ?? "unknown" });
+      }
       notifyIncompatible(ctx, adapter, pf);
       // Audit #22: this early return used to strand a previously-patched
       // ~/.claude/settings.json forever — no cliSync runs on this path and
