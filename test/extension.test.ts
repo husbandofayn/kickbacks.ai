@@ -17,6 +17,8 @@ vi.mock("../src/log", () => ({ debugEnabled: () => false, dlog: () => {},
 // `cliRestore` records restore() calls for the #22 regression below.
 const cliRestore = vi.hoisted(() =>
   vi.fn(() => ({ ok: true, restored: true })));
+const cliApply = vi.hoisted(() =>
+  vi.fn(() => ({ ok: true })));
 vi.mock("../src/adapters/claude-cli/adapter", () => ({
   resolveStatuslineAsset: () => "",
   ClaudeCliStatuslineAdapter: class {
@@ -24,13 +26,13 @@ vi.mock("../src/adapters/claude-cli/adapter", () => ({
     spinnerVerbsSupported = true;
     version() { return "cli"; }
     preflight() { return { ok: true, compatible: true, version: "cli" }; }
-    applyPatch() { return { ok: true }; }
+    applyPatch = cliApply;
     restore = cliRestore;
   },
 }));
 
 import { activate, deactivate, __wireForTest } from "../src/extension";
-import { makeContext, _warned } from "./mocks/vscode";
+import { commands, makeContext, _warned, secrets } from "./mocks/vscode";
 import { ImpressionDedupe } from "../src/metrics/dedupe";
 
 it("loopback impression path dedupes per adId (one bill per ad)", () => {
@@ -65,7 +67,7 @@ describe("extension orchestration", { timeout: 15_000 }, () => {
     await deactivate();
   });
 
-  it("audit #22: incompatible/missing Claude Code still cleans the CLI"
+  it("audit #22: incompatible Claude Code still cleans the CLI"
     + " settings surface and leaves it restorable at deactivate", async () => {
     const adapter = {
       name: "claude-code",
@@ -78,10 +80,9 @@ describe("extension orchestration", { timeout: 15_000 }, () => {
     __wireForTest({ adapter, statusBar: sb });
     cliRestore.mockClear();
     await activate(makeContext() as never);
-    // Pre-fix the early return ran before ANY claude-cli adapter existed, so
-    // a stale statusLine/spinnerVerbs patch from a prior session (crash /
-    // CC uninstalled-but-terminal-CLI-kept) was stranded forever. Now it is
-    // cleaned once on this path…
+    // Pre-fix the incompatible early return ran before ANY claude-cli adapter
+    // existed, so a stale statusLine/spinnerVerbs patch from a prior session
+    // was stranded forever. Now it is cleaned once on this path…
     expect(cliRestore,
       "incompatible path must run the key-scoped CLI restore")
       .toHaveBeenCalled();
@@ -92,6 +93,73 @@ describe("extension orchestration", { timeout: 15_000 }, () => {
     expect(cliRestore,
       "deactivate must still be able to restore the CLI surface")
       .toHaveBeenCalled();
+  });
+
+  it("missing VS Code target still serves the Claude Code CLI", async () => {
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/v1/portfolio")) {
+        return new Response(JSON.stringify({
+          ttl_seconds: 60,
+          ads: [{
+            ad_id: "ad-cli",
+            campaign_id: "camp-cli",
+            title_text: "CLI ad",
+            icon_ref: "",
+            click_url: "https://example.com",
+            session_token: "sess-cli",
+          }],
+        }), { status: 200 });
+      }
+      if (url.includes("/v1/killswitch")) {
+        return new Response(JSON.stringify({ killed: false }), { status: 200 });
+      }
+      if (url.includes("/v1/earnings")) {
+        return new Response(JSON.stringify({
+          lifetime_usd: "0.00",
+          today_usd: "0.00",
+        }), { status: 200 });
+      }
+      if (url.includes("/v1/me/consent")) {
+        return new Response(JSON.stringify({
+          telemetry_opt_in: true,
+          tos_accepted_version: "1",
+          current_tos_version: "1",
+        }), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    try {
+      const adapter = {
+        name: "claude-code",
+        preflight: () => ({ ok: true, compatible: false, version: null,
+          reason: "target not found" }),
+        version: () => null,
+        applyPatch: vi.fn(() => ({ ok: false, reason: "target not found" })),
+        restore: vi.fn(() => ({ ok: true, restored: false })),
+      };
+      const sb = { set: vi.fn(), dispose() {} };
+      const ctx = makeContext();
+      secrets.set("kickbacks.access", "tok");
+      commands._handlers.delete("kickbacks.signIn");
+      cliApply.mockClear();
+      __wireForTest({ adapter, statusBar: sb });
+      await activate(ctx as never);
+      expect(adapter.applyPatch,
+        "webview patching must stay skipped without a VS Code target")
+        .not.toHaveBeenCalled();
+      expect(cliApply,
+        "CLI sync should still write ~/.claude/settings.json")
+        .toHaveBeenCalledWith(expect.objectContaining({ adText: "CLI ad" }));
+      expect(commands._handlers.has("kickbacks.signIn")).toBe(true);
+      expect(sb.set).not.toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "incompatible" }));
+      await deactivate();
+    } finally {
+      globalThis.fetch = oldFetch;
+      secrets.clear();
+    }
   });
 
   it("genuine verb-array miss -> warns the user (wiring), status incompatible", async () => {

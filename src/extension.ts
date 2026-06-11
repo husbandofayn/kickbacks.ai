@@ -40,7 +40,7 @@ import { TestHooks } from "./testHooks";
 import { buildLabel, buildVersion } from "./buildinfo";
 import { dlog, debugEnabled, codexEnabled, codexCliEnabled,
          testHooksEnabled } from "./log";
-import { webviewMode } from "./modes";
+import { cliMode, webviewMode } from "./modes";
 import { SessionState } from "./sessionState";
 import { watchFile as nodeWatchFile, readFileSync, statSync } from "node:fs";
 import { reloadSentinelPath, parseSentinel, decideReload } from "./reloadSignal";
@@ -276,7 +276,8 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     const pf = adapter.preflight();
     dlog("ext", "preflight",
       { compatible: pf.compatible, version: pf.version, reason: pf.reason });
-    if (!pf.compatible) {
+    const cliOnly = !pf.compatible && pf.reason === "target not found";
+    if (!pf.compatible && !cliOnly) {
       statusBar.set({ kind: "incompatible", version: pf.version ?? "unknown" });
       notifyIncompatible(ctx, adapter, pf);
       // Audit #22: this early return used to strand a previously-patched
@@ -301,7 +302,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     // Gated on the patch actually being ON (a failed apply means a reload
     // wouldn't help). The sticky lock clears itself on the reload (fresh
     // activation re-creates the StatusBar).
-    if (firstRun && debugCtl.on()) {
+    if (pf.compatible && firstRun && debugCtl.on()) {
       dlog("ext", "installNudge.show", {});
       statusBar.set({ kind: "needs-reload" });
       void showInstallReloadNudge();
@@ -335,7 +336,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
       client: consentClient, ctx, vsc: vscode,
       dlog: (msg) => dlog("ext", "consent", { msg }),
     });
-    const ccVersion = pf.version ?? "unknown";
+    const ccVersion = pf.version ?? (cliOnly ? "cli" : "unknown");
     session.set({ ccVersion });
 
     // ─── Earnings ───────────────────────────────────────────────────
@@ -501,6 +502,13 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     let wvResult: WebviewInjectionResult = { lbInfo: null,
       reapplyCodex: null, cycleReassert: null, refreshPortfolioNow: null };
     const bringUpServing = async (): Promise<void> => {
+      if (cliOnly) {
+        dlog("ext", "webview.skip", { reason: "target not found" });
+        wvResult = { lbInfo: null, reapplyCodex: null, cycleReassert: null,
+          refreshPortfolioNow: null };
+        lbInfo = null;
+        return;
+      }
       wvResult = await setupWebviewInjection({
         ctx, actx, adapter, auth, debugCtl, session, portfolio,
         metrics, logTail, testHooks, statusBar, ccVersion,
@@ -515,7 +523,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     };
     await bringUpServing();
 
-    if (ad && override?.killed !== true && webviewMode() === "off") {
+    if (pf.compatible && ad && override?.killed !== true && webviewMode() === "off") {
       adapter.restore();
       restoreCodexSafe(codexAdapter);
       dlog("ext", "webview.forced-off", {});
@@ -530,7 +538,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     // The kill-switch, a crash-canary suspension, and an off webviewMode
     // still win (prime directive: a killed / opted-out / crash-suspect
     // install must never have CC files touched).
-    if (!killed && !servingSuspended() && webviewMode() === "on") {
+    if (pf.compatible && !killed && !servingSuspended() && webviewMode() === "on") {
       try { adapter.prime?.(); } catch { /* prime directive */ }
       try { codexAdapter?.prime?.(); } catch { /* prime directive */ }
     }
@@ -547,6 +555,16 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     // Now that the CLI sync exists, point the ad-apply hook at it so every
     // subsequent applyAd re-syncs the CLI surface immediately.
     cliResync.run = cliSync.syncNow;
+
+    const refreshPortfolioForCli = async (): Promise<void> => {
+      const r = await fetchPortfolioWithDemoFallback(portfolio, auth, ccVersion);
+      portfolioResp = r;
+      viewThresholdMs = r?.viewThresholdMs ?? viewThresholdMs;
+      ad = r?.ad ?? null;
+      session.set({ hasAd: !!ad });
+      if (ad) debugCtl.setPortfolioAd(ad.adText, ad.clickUrl || "");
+      cliResync.run();
+    };
 
     // ─── Status bar ad ──────────────────────────────────────────────
     setupStatusBarAd({
@@ -572,21 +590,24 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     // ONLY when CC is actively in use (independent transcript-mtime signal)
     // yet our overlay telemetry has gone silent — never when simply idle.
     const hardReassert = (): void => {
+      if (cliOnly) return;
       try {
         const c = debugCtl.cyclePatch();        // debug-injection path
         if (!c.ok) wvResult.cycleReassert?.();  // production server-ad path
       } catch { /* prime directive */ }
     };
-    setupDesyncDetector(desyncState, actx.timers, {
-      ccActivityAgeMs: () => logTail.activityAgeMs(),
-      // canPatch() folds in the serving gate (kill posture, master toggle,
-      // canary suspension) so the watchdog can never "heal" a gated install.
-      healthy: () => canPatch() && shouldReassert({
-        haveAd: !!adRef.current,
-        killed: killedRef.current,
-      }),
-      hardReassert,
-    });
+    if (!cliOnly) {
+      setupDesyncDetector(desyncState, actx.timers, {
+        ccActivityAgeMs: () => logTail.activityAgeMs(),
+        // canPatch() folds in the serving gate (kill posture, master toggle,
+        // canary suspension) so the watchdog can never "heal" a gated install.
+        healthy: () => canPatch() && shouldReassert({
+          haveAd: !!adRef.current,
+          killed: killedRef.current,
+        }),
+        hardReassert,
+      });
+    }
 
     // Login trigger: reassert the patch immediately after a successful
     // interactive sign-in (don't wait up to 60s for the next reassert tick).
@@ -599,7 +620,11 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
         // of 403-ing on the authed endpoint with a stale demo token. `force`
         // re-applies even when the adId set is unchanged. No-op (null) when the
         // overlay never set up (no ad at activation).
-        void wvResult.refreshPortfolioNow?.(true);
+        if (wvResult.refreshPortfolioNow) {
+          void wvResult.refreshPortfolioNow(true);
+        } else {
+          void refreshPortfolioForCli();
+        }
         // The live swap above is best-effort; a reload is the path that
         // always works. Tell the user every time they sign in.
         void showSignInReloadNudge();
@@ -617,7 +642,9 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
     // (checkKill clearing the posture) brings serving up in-session
     // without a reload. Ends permanently on success; every pending timer
     // lives in actx.timers so deactivate() disposes it.
-    const servingUp = (): boolean => wvResult.refreshPortfolioNow !== null;
+    const servingUp = (): boolean => cliOnly
+      ? adRef.current !== null
+      : wvResult.refreshPortfolioNow !== null;
     const RETRY_CAP_MS = 5 * 60_000;
     let retryDelayMs = override?.servingRetryBaseMs ?? 30_000;
     const retryActx = actx;   // a newer activation owns its own loop
@@ -643,6 +670,11 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
             }
           }
           if (adRef.current && actx === retryActx) {
+            if (cliOnly) {
+              cliResync.run();
+              dlog("ext", "cli.retry.up", {});
+              return;
+            }
             await bringUpServing();
             if (servingUp()) {
               dlog("ext", "serving.retry.up", { port: lbInfo?.port });
@@ -656,7 +688,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
       }
       scheduleServingRetry();
     };
-    if (!servingUp() && webviewMode() === "on") {
+    if (!servingUp() && (cliOnly ? cliMode() === "on" : webviewMode() === "on")) {
       dlog("ext", "serving.retry.armed", { inMs: retryDelayMs });
       scheduleServingRetry();
     }
